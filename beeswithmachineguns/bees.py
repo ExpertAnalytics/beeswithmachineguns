@@ -29,13 +29,11 @@ import os
 import re
 import socket
 import time
-import urllib
 import urllib2
 import base64
 import csv
 import sys
 import random
-import ssl
 
 import boto
 import boto.ec2
@@ -44,6 +42,7 @@ import paramiko
 STATE_FILENAME = os.path.expanduser('~/.bees')
 
 # Utilities
+
 
 def _read_server_list():
     instance_ids = []
@@ -62,6 +61,7 @@ def _read_server_list():
 
     return (username, key_name, zone, instance_ids)
 
+
 def _write_server_list(username, key_name, zone, instances):
     with open(STATE_FILENAME, 'w') as f:
         f.write('%s\n' % username)
@@ -69,14 +69,18 @@ def _write_server_list(username, key_name, zone, instances):
         f.write('%s\n' % zone)
         f.write('\n'.join([instance.id for instance in instances]))
 
+
 def _delete_server_list():
     os.remove(STATE_FILENAME)
+
 
 def _get_pem_path(key):
     return os.path.expanduser('~/.ssh/%s.pem' % key)
 
+
 def _get_region(zone):
-    return zone if 'gov' in zone else zone[:-1] # chop off the "d" in the "us-east-1d" to get the "Region"
+    return zone if 'gov' in zone else zone[:-1]  # chop off the "d" in the "us-east-1d" to get the "Region"
+
 
 def _get_security_group_ids(connection, security_group_names, subnet):
     ids = []
@@ -87,17 +91,27 @@ def _get_security_group_ids(connection, security_group_names, subnet):
     for group in security_groups:
         for name in security_group_names:
             if group.name == name:
-                if subnet == None:
-                    if group.vpc_id == None:
+                if subnet is None:
+                    if group.vpc_id is None:
                         ids.append(group.id)
-                    elif group.vpc_id != None:
+                    elif group.vpc_id is not None:
                         ids.append(group.id)
 
         return ids
 
+
+def _get_boto_conf():
+
+    boto_conf = open(os.environ['HOME'] + "/.boto").readlines()
+    boto_conf = [l.strip() for l in boto_conf]
+    aws_access_key_id = [l.split(' = ')[1] for l in boto_conf if l.startswith('aws_access_key_id')][0]
+    aws_secret_access_key = [l.split(' = ')[1] for l in boto_conf if l.startswith('aws_secret_access_key')][0]
+    return (aws_access_key_id, aws_secret_access_key)
+
 # Methods
 
-def up(count, group, zone, image_id, instance_type, username, key_name, subnet, bid = None):
+
+def up(count, group, zone, image_id, instance_type, username, key_name, subnet, bid=None):
     """
     Startup the load testing server.
     """
@@ -113,11 +127,16 @@ def up(count, group, zone, image_id, instance_type, username, key_name, subnet, 
     pem_path = _get_pem_path(key_name)
 
     if not os.path.isfile(pem_path):
-        print 'Warning. No key file found for %s. You will need to add this key to your SSH agent to connect.' % pem_path
+        print 'Warning. No key file found for %s. You will need to add this key to your SSH agent to connect.' % \
+            pem_path
 
     print 'Connecting to the hive.'
 
-    ec2_connection = boto.ec2.connect_to_region(_get_region(zone))
+    aws_access_key_id, aws_secret_access_key = _get_boto_conf()
+    ec2_connection = boto.ec2.connect_to_region(
+        _get_region(zone),
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key)
 
     if bid:
         print 'Attempting to call up %i spot bees, this can take a while...' % count
@@ -166,11 +185,12 @@ def up(count, group, zone, image_id, instance_type, username, key_name, subnet, 
 
         print 'Bee %s is ready for the attack.' % instance.id
 
-    ec2_connection.create_tags(instance_ids, { "Name": "a bee!" })
+    ec2_connection.create_tags(instance_ids, {"Name": "a bee!"})
 
     _write_server_list(username, key_name, zone, instances)
 
     print 'The swarm has assembled %i bees.' % len(instances)
+
 
 def report():
     """
@@ -182,7 +202,11 @@ def report():
         print 'No bees have been mobilized.'
         return
 
-    ec2_connection = boto.ec2.connect_to_region(_get_region(zone))
+    aws_access_key_id, aws_secret_access_key = _get_boto_conf()
+    ec2_connection = boto.ec2.connect_to_region(
+        _get_region(zone),
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key)
 
     reservations = ec2_connection.get_all_instances(instance_ids=instance_ids)
 
@@ -193,6 +217,7 @@ def report():
 
     for instance in instances:
         print 'Bee %s: %s @ %s' % (instance.id, instance.state, instance.ip_address)
+
 
 def down():
     """
@@ -206,7 +231,11 @@ def down():
 
     print 'Connecting to the hive.'
 
-    ec2_connection = boto.ec2.connect_to_region(_get_region(zone))
+    aws_access_key_id, aws_secret_access_key = _get_boto_conf()
+    ec2_connection = boto.ec2.connect_to_region(
+        _get_region(zone),
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key)
 
     print 'Calling off the swarm.'
 
@@ -217,14 +246,15 @@ def down():
 
     _delete_server_list()
 
-def _wait_for_spot_request_fulfillment(conn, requests, fulfilled_requests = []):
+
+def _wait_for_spot_request_fulfillment(conn, requests, fulfilled_requests=[]):
     """
     Wait until all spot requests are fulfilled.
 
     Once all spot requests are fulfilled, return a list of corresponding spot instances.
     """
     if len(requests) == 0:
-        reservations = conn.get_all_instances(instance_ids = [r.instance_id for r in fulfilled_requests])
+        reservations = conn.get_all_instances(instance_ids=[r.instance_id for r in fulfilled_requests])
         return [r.instances[0] for r in reservations]
     else:
         time.sleep(10)
@@ -236,7 +266,9 @@ def _wait_for_spot_request_fulfillment(conn, requests, fulfilled_requests = []):
             fulfilled_requests.append(req)
             print "spot bee `{}` joined the swarm.".format(req.instance_id)
 
-    return _wait_for_spot_request_fulfillment(conn, [r for r in requests if r not in fulfilled_requests], fulfilled_requests)
+    return _wait_for_spot_request_fulfillment(
+        conn, [r for r in requests if r not in fulfilled_requests], fulfilled_requests)
+
 
 def _attack(params):
     """
@@ -277,8 +309,10 @@ def _attack(params):
             return None
 
         if params['post_file']:
-            pem_file_path=_get_pem_path(params['key_name'])
-            os.system("scp -q -o 'StrictHostKeyChecking=no' -i %s %s %s@%s:/tmp/honeycomb" % (pem_file_path, params['post_file'], params['username'], params['instance_name']))
+            pem_file_path = _get_pem_path(params['key_name'])
+            os.system(
+                "scp -q -o 'StrictHostKeyChecking=no' -i %s %s %s@%s:/tmp/honeycomb" % \
+                (pem_file_path, params['post_file'], params['username'], params['instance_name']))
             options += ' -T "%(mime_type)s; charset=UTF-8" -p /tmp/honeycomb' % params
 
         if params['keep_alive']:
@@ -292,8 +326,13 @@ def _attack(params):
         if params['basic_auth'] is not '':
             options += ' -A %s' % params['basic_auth']
 
+        # Make sure ab is installed:
+        stdin, stdout, stderr = client.exec_command("sudo apt-get update; sudo apt-get -y install apache2-utils")
+        dummy = stdout.read()
+
         params['options'] = options
         benchmark_command = 'ab -r -n %(num_requests)s -c %(concurrent_requests)s %(options)s "%(url)s"' % params
+        print benchmark_command
         stdin, stdout, stderr = client.exec_command(benchmark_command)
 
         response = {}
@@ -312,14 +351,18 @@ def _attack(params):
         response['failed_requests_length'] = 0
         response['failed_requests_exceptions'] = 0
         if float(failed_requests.group(1)) > 0:
-            failed_requests_detail = re.search('(Connect: [0-9.]+, Receive: [0-9.]+, Length: [0-9.]+, Exceptions: [0-9.]+)', ab_results)
+            failed_requests_detail = re.search(
+                '(Connect: [0-9.]+, Receive: [0-9.]+, Length: [0-9.]+, Exceptions: [0-9.]+)', ab_results)
             if failed_requests_detail:
-                response['failed_requests_connect'] = float(re.search('Connect:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
-                response['failed_requests_receive'] = float(re.search('Receive:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
-                response['failed_requests_length'] = float(re.search('Length:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
-                response['failed_requests_exceptions'] = float(re.search('Exceptions:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
+                response['failed_requests_connect'] = float(
+                    re.search('Connect:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
+                response['failed_requests_receive'] = float(
+                    re.search('Receive:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
+                response['failed_requests_length'] = float(
+                    re.search('Length:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
+                response['failed_requests_exceptions'] = float(
+                    re.search('Exceptions:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
 
-        
         complete_requests_search = re.search('Complete\ requests:\s+([0-9]+)', ab_results)
 
         response['ms_per_request'] = float(ms_per_request_search.group(1))
@@ -352,7 +395,8 @@ def _summarize_results(results, params, csv_filename):
     summarized_results['complete_bees'] = [r for r in results if r is not None and type(r) != socket.error]
     summarized_results['timeout_bees_params'] = [p for r, p in zip(results, params) if r is None]
     summarized_results['exception_bees_params'] = [p for r, p in zip(results, params) if type(r) == socket.error]
-    summarized_results['complete_bees_params'] = [p for r, p in zip(results, params) if r is not None and type(r) != socket.error]
+    summarized_results['complete_bees_params'] = \
+        [p for r, p in zip(results, params) if r is not None and type(r) != socket.error]
     summarized_results['num_timeout_bees'] = len(summarized_results['timeout_bees'])
     summarized_results['num_exception_bees'] = len(summarized_results['exception_bees'])
     summarized_results['num_complete_bees'] = len(summarized_results['complete_bees'])
@@ -399,9 +443,11 @@ def _summarize_results(results, params, csv_filename):
         else:
             summarized_results['performance_accepted'] = False
 
-    summarized_results['request_time_cdf'] = _get_request_time_cdf(summarized_results['total_complete_requests'], summarized_results['complete_bees'])
+    summarized_results['request_time_cdf'] = _get_request_time_cdf(
+        summarized_results['total_complete_requests'], summarized_results['complete_bees'])
     if csv_filename:
-        _create_request_time_cdf_csv(results, summarized_results['complete_bees_params'], summarized_results['request_time_cdf'], csv_filename)
+        _create_request_time_cdf_csv(
+            results, summarized_results['complete_bees_params'], summarized_results['request_time_cdf'], csv_filename)
 
     return summarized_results
 
@@ -415,10 +461,10 @@ def _create_request_time_cdf_csv(results, complete_bees_params, request_time_cdf
                 header.append("bee %(instance_id)s [ms]" % p)
             writer.writerow(header)
             for i in range(100):
-                row = [i, request_time_cdf[i]] if i < len(request_time_cdf) else [i,float("inf")]
+                row = [i, request_time_cdf[i]] if i < len(request_time_cdf) else [i, float("inf")]
                 for r in results:
                     if r is not None:
-                    	row.append(r['request_time_cdf'][i]["Time in ms"])
+                        row.append(r['request_time_cdf'][i]["Time in ms"])
                 writer.writerow(row)
 
 
@@ -514,7 +560,8 @@ def attack(url, n, c, **options):
 
     print 'Connecting to the hive.'
 
-    ec2_connection = boto.ec2.connect_to_region(_get_region(zone))
+    aws_access_key_id, aws_secret_access_key = _get_boto_conf()
+    ec2_connection = boto.ec2.connect_to_region(_get_region(zone), aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key)
 
     print 'Assembling bees.'
 
