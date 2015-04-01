@@ -28,6 +28,7 @@ import bees
 from urlparse import urlparse
 from optparse import OptionParser, OptionGroup
 
+
 def parse_options():
     """
     Handle the command line arguments for spinning up bees
@@ -79,6 +80,9 @@ commands:
     up_group.add_option('-b', '--bid', metavar="BID", nargs=1,
                         action='store', dest='bid', type='float', default=None,
                         help="The maximum bid price per spot instance (default: None).")
+    up_group.add_option('-f', '--initfile', metavar="initfile", nargs=1,
+                        action='store', dest='initfile', type='string', default='initbees.tgz',
+                        help="An initialization file that will be uploaded and unpacked to each server.")
 
     parser.add_option_group(up_group)
 
@@ -95,6 +99,9 @@ commands:
     attack_group.add_option('-p', '--post-file',  metavar="POST_FILE",  nargs=1,
                             action='store', dest='post_file', type='string', default=False,
                             help="The POST file to deliver with the bee's payload.")
+    attack_group.add_option('-a', '--custom_attack', metavar="CUSTOM_ATTACK", nargs=1,
+                            action='store', dest='custom_attack', type='string', default=False,
+                            help="A custom attack; run as a script.")
     attack_group.add_option('-m', '--mime-type',  metavar="MIME_TYPE",  nargs=1,
                             action='store', dest='mime_type', type='string', default='text/plain',
                             help="The MIME type to send with the request.")
@@ -138,7 +145,7 @@ commands:
         if options.group == 'default':
             print 'New bees will use the "default" EC2 security group. Please note that port 22 (SSH) is not normally open on this group. You will need to use to the EC2 tools to open it before you will be able to attack.'
 
-        bees.up(options.servers, options.group, options.zone, options.instance, options.type, options.login, options.key, options.subnet, options.bid)
+        bees.up(options.servers, options.group, options.zone, options.instance, options.type, options.login, options.key, options.subnet, options.bid, options.initfile)
     elif command == 'attack':
         if not options.url:
             parser.error('To run an attack you need to specify a url with -u')
@@ -158,6 +165,7 @@ commands:
             keep_alive=options.keep_alive,
             mime_type=options.mime_type,
             csv_filename=options.csv_filename,
+            custom_attack=options.custom_attack,
             tpr=options.tpr,
             rps=options.rps,
             basic_auth=options.basic_auth
@@ -169,6 +177,7 @@ commands:
         bees.down()
     elif command == 'report':
         bees.report()
+
 
 def main():
     parse_options()

@@ -33,6 +33,7 @@ import urllib2
 import base64
 import csv
 import sys
+import ssl
 import random
 
 import boto
@@ -111,7 +112,7 @@ def _get_boto_conf():
 # Methods
 
 
-def up(count, group, zone, image_id, instance_type, username, key_name, subnet, bid=None):
+def up(count, group, zone, image_id, instance_type, username, key_name, subnet, bid=None, initfile=None):
     """
     Startup the load testing server.
     """
@@ -189,8 +190,81 @@ def up(count, group, zone, image_id, instance_type, username, key_name, subnet, 
 
     _write_server_list(username, key_name, zone, instances)
 
+    if initfile:
+        initbees(instances, initfile, username, key_name)
+
     print 'The swarm has assembled %i bees.' % len(instances)
 
+
+def initbees(instances, initfile, username, key_name):
+    """
+    Initialize bees with the necessary software to execute the tasks. This is done in two steps:
+    1. If a file named "initbees.tgz" is found in the current directory or the <initfile> option is
+       specified, copy this file to the nodes and unpack it.
+    2. If the unpacked initfile contains a script "initscript.sh" in the root-directory, this
+       script is run with sudo-rights such that it can install packages with apt-get
+    """
+
+    if os.path.isfile(initfile):
+        params = []
+        for i, instance in enumerate(instances):
+            params.append({
+                'i': i,
+                'instance_id': instance.id,
+                'instance_name': instance.private_dns_name if
+                instance.public_dns_name == "" else instance.public_dns_name,
+                'username': username,
+                'key_name': key_name,
+                'initfile': initfile,
+            })
+
+        not_finished = True
+        while not_finished:
+            pool = Pool(len(params))
+            results = pool.map(_initbees, params)
+            failed = [r['i'] for r in results if r['status'] != 'ok']
+            if len(failed)  > 0:
+                params = [p for p in params if p['i'] in failed]
+            else:
+                not_finished = False
+
+        print "All bees initialized"
+
+def _initbees(params):
+    """
+    Perform bee initialization
+    """
+
+    print 'Init bee %i.' % params['i']
+
+    try:
+        client, pem_file_path = _init_ssh_client(params)
+
+        print 'Loading up and unpack init file on %s.' % params['instance_name']
+        os.system(
+            "scp -q -o 'StrictHostKeyChecking=no' -i %s %s %s@%s:." %
+            (pem_file_path, params['initfile'], params['username'], params['instance_name']))
+        stdin, stdout, stderr = client.exec_command("tar zxf %s" % os.path.basename(params['initfile']))
+        dummy = stdout.read()
+        #print stderr.read()
+
+        stdin, stdout, stderr = client.exec_command("[ -f initscript.sh ] && (sudo bash initscript.sh 2>&1)")
+        result =  stdout.read()
+        result_search = re.search('Successfully installed mechanize', result)
+        response = {}
+        response['i'] = params['i']
+        if not result_search:
+            print "Mechanize not installed on %i - re-run init" % params['i']
+            response['status'] = 'fail'
+        else:
+            print "Everything is ok on bee %i" % params['i']
+            response['status'] = 'ok'
+
+    except socket.error, e:
+        return {'i': params['i'], 'status': 'except'}
+
+    print 'Init bee %i finished.' % params['i']
+    return response
 
 def report():
     """
@@ -270,6 +344,43 @@ def _wait_for_spot_request_fulfillment(conn, requests, fulfilled_requests=[]):
         conn, [r for r in requests if r not in fulfilled_requests], fulfilled_requests)
 
 
+def _init_ssh_client(params, num_retries=5, timeout=10):
+    """
+    Create ssh connection to a node.
+    Freshly created ec2 nodes may take a while before ssh is available, so we will retry num_retries times (default 5)
+    """
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    pem_path = params.get('key_name') and _get_pem_path(params['key_name']) or None
+    retries = 0
+    not_connected = True
+    while retries < num_retries and not_connected:
+        try:
+            if not os.path.isfile(pem_path):
+                client.load_system_host_keys()
+                client.connect(params['instance_name'], username=params['username'], timeout=timeout)
+            else:
+                client.connect(
+                    params['instance_name'],
+                    username=params['username'],
+                    key_filename=pem_path,
+                    timeout=timeout)
+        except socket.error, e:
+            if retries >= num_retries:
+                raise e
+            else:
+                # retries left; increment and move on
+                retries += 1
+                print "Still not connected to %s; sleep %s before trying again. %s attempts left" %  \
+                    (params['instance_name'], timeout, num_retries-retries)
+                time.sleep(5)
+        else:
+            # we are connected
+            not_connected = False
+
+    return (client, pem_path)
+
 def _attack(params):
     """
     Test the target URL with requests.
@@ -279,20 +390,10 @@ def _attack(params):
     print 'Bee %i is joining the swarm.' % params['i']
 
     try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        pem_path = params.get('key_name') and _get_pem_path(params['key_name']) or None
-        if not os.path.isfile(pem_path):
-            client.load_system_host_keys()
-            client.connect(params['instance_name'], username=params['username'])
-        else:
-            client.connect(
-                params['instance_name'],
-                username=params['username'],
-                key_filename=pem_path)
 
         print 'Bee %i is firing her machine gun. Bang bang!' % params['i']
+
+        client, pem_path = _init_ssh_client(params)
 
         options = ''
         if params['headers'] is not '':
@@ -326,58 +427,88 @@ def _attack(params):
         if params['basic_auth'] is not '':
             options += ' -A %s' % params['basic_auth']
 
-        # Make sure ab is installed:
-        stdin, stdout, stderr = client.exec_command("sudo apt-get update; sudo apt-get -y install apache2-utils")
-        dummy = stdout.read()
+        if params.get('custom_attack', False):
+            # Run a custom attack, expect output to be lines <iter>,<time>
+            benchmark_command = '%(custom_attack)s -n %(num_requests)s -e %(csv_filename)s %(url)s' % params
+            print benchmark_command
+            stdin, stdout, stderr = client.exec_command(benchmark_command)
+            dummy = stdout.read()
+            dummy =  stderr.read()
 
-        params['options'] = options
-        benchmark_command = 'ab -r -n %(num_requests)s -c %(concurrent_requests)s %(options)s "%(url)s"' % params
-        print benchmark_command
-        stdin, stdout, stderr = client.exec_command(benchmark_command)
+            # Get the result
+            stdin, stdout, stderr = client.exec_command('cat %(csv_filename)s' % params)
+            response = {}
+            response['request_time_cdf'] = []
+            complete_requests = 0
+            failed_requests = 0
+            total_ms_requests = 0
+            for row in csv.DictReader(stdout):
+                if row["Time in ms"] == 'failed':
+                    failed_requests += 1
+                else:
+                    row["Time in ms"] = float(row["Time in ms"])
+                    total_ms_requests += row["Time in ms"]
+                    complete_requests += 1
+                    response['request_time_cdf'].append(row)
+            if complete_requests > 0:
+                response['ms_per_request'] = total_ms_requests / (1.0*complete_requests)
+            else:
+                response['ms_per_request'] = 0
+            response['failed_requests'] = failed_requests
+            response['complete_requests'] = complete_requests
+            if not response['request_time_cdf']:
+                print 'Bee %i lost sight of the target (connection timed out reading result csv).' % params['i']
+                return None
+        else:
+            # Regular attack
+            params['options'] = options
+            benchmark_command = 'ab -r -n %(num_requests)s -c %(concurrent_requests)s %(options)s "%(url)s"' % params
+            print benchmark_command
+            stdin, stdout, stderr = client.exec_command(benchmark_command)
 
-        response = {}
+            response = {}
 
-        ab_results = stdout.read()
-        ms_per_request_search = re.search('Time\ per\ request:\s+([0-9.]+)\ \[ms\]\ \(mean\)', ab_results)
+            ab_results = stdout.read()
+            ms_per_request_search = re.search('Time\ per\ request:\s+([0-9.]+)\ \[ms\]\ \(mean\)', ab_results)
 
-        if not ms_per_request_search:
-            print 'Bee %i lost sight of the target (connection timed out running ab).' % params['i']
-            return None
+            if not ms_per_request_search:
+                print 'Bee %i lost sight of the target (connection timed out running ab).' % params['i']
+                return None
 
-        requests_per_second_search = re.search('Requests\ per\ second:\s+([0-9.]+)\ \[#\/sec\]\ \(mean\)', ab_results)
-        failed_requests = re.search('Failed\ requests:\s+([0-9.]+)', ab_results)
-        response['failed_requests_connect'] = 0
-        response['failed_requests_receive'] = 0
-        response['failed_requests_length'] = 0
-        response['failed_requests_exceptions'] = 0
-        if float(failed_requests.group(1)) > 0:
-            failed_requests_detail = re.search(
-                '(Connect: [0-9.]+, Receive: [0-9.]+, Length: [0-9.]+, Exceptions: [0-9.]+)', ab_results)
-            if failed_requests_detail:
-                response['failed_requests_connect'] = float(
-                    re.search('Connect:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
-                response['failed_requests_receive'] = float(
-                    re.search('Receive:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
-                response['failed_requests_length'] = float(
-                    re.search('Length:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
-                response['failed_requests_exceptions'] = float(
-                    re.search('Exceptions:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
+            requests_per_second_search = re.search('Requests\ per\ second:\s+([0-9.]+)\ \[#\/sec\]\ \(mean\)', ab_results)
+            failed_requests = re.search('Failed\ requests:\s+([0-9.]+)', ab_results)
+            response['failed_requests_connect'] = 0
+            response['failed_requests_receive'] = 0
+            response['failed_requests_length'] = 0
+            response['failed_requests_exceptions'] = 0
+            if float(failed_requests.group(1)) > 0:
+                failed_requests_detail = re.search(
+                    '(Connect: [0-9.]+, Receive: [0-9.]+, Length: [0-9.]+, Exceptions: [0-9.]+)', ab_results)
+                if failed_requests_detail:
+                    response['failed_requests_connect'] = float(
+                        re.search('Connect:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
+                    response['failed_requests_receive'] = float(
+                        re.search('Receive:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
+                    response['failed_requests_length'] = float(
+                        re.search('Length:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
+                    response['failed_requests_exceptions'] = float(
+                        re.search('Exceptions:\s+([0-9.]+)', failed_requests_detail.group(0)).group(1))
 
-        complete_requests_search = re.search('Complete\ requests:\s+([0-9]+)', ab_results)
+            complete_requests_search = re.search('Complete\ requests:\s+([0-9]+)', ab_results)
 
-        response['ms_per_request'] = float(ms_per_request_search.group(1))
-        response['requests_per_second'] = float(requests_per_second_search.group(1))
-        response['failed_requests'] = float(failed_requests.group(1))
-        response['complete_requests'] = float(complete_requests_search.group(1))
+            response['ms_per_request'] = float(ms_per_request_search.group(1))
+            response['requests_per_second'] = float(requests_per_second_search.group(1))
+            response['failed_requests'] = float(failed_requests.group(1))
+            response['complete_requests'] = float(complete_requests_search.group(1))
 
-        stdin, stdout, stderr = client.exec_command('cat %(csv_filename)s' % params)
-        response['request_time_cdf'] = []
-        for row in csv.DictReader(stdout):
-            row["Time in ms"] = float(row["Time in ms"])
-            response['request_time_cdf'].append(row)
-        if not response['request_time_cdf']:
-            print 'Bee %i lost sight of the target (connection timed out reading csv).' % params['i']
-            return None
+            stdin, stdout, stderr = client.exec_command('cat %(csv_filename)s' % params)
+            response['request_time_cdf'] = []
+            for row in csv.DictReader(stdout):
+                row["Time in ms"] = float(row["Time in ms"])
+                response['request_time_cdf'].append(row)
+            if not response['request_time_cdf']:
+                print 'Bee %i lost sight of the target (connection timed out reading csv).' % params['i']
+                return None
 
         print 'Bee %i is out of ammo.' % params['i']
 
@@ -389,6 +520,10 @@ def _attack(params):
 
 
 def _summarize_results(results, params, csv_filename):
+    regular_attack = True
+    if params[0].get('custom_attack', False):
+        regular_attack = False
+
     summarized_results = dict()
     summarized_results['timeout_bees'] = [r for r in results if r is None]
     summarized_results['exception_bees'] = [r for r in results if type(r) == socket.error]
@@ -407,20 +542,28 @@ def _summarize_results(results, params, csv_filename):
     complete_results = [r['failed_requests'] for r in summarized_results['complete_bees']]
     summarized_results['total_failed_requests'] = sum(complete_results)
 
-    complete_results = [r['failed_requests_connect'] for r in summarized_results['complete_bees']]
-    summarized_results['total_failed_requests_connect'] = sum(complete_results)
+    if regular_attack:
+        complete_results = [r['failed_requests_connect'] for r in summarized_results['complete_bees']]
+        summarized_results['total_failed_requests_connect'] = sum(complete_results)
 
-    complete_results = [r['failed_requests_receive'] for r in summarized_results['complete_bees']]
-    summarized_results['total_failed_requests_receive'] = sum(complete_results)
+        complete_results = [r['failed_requests_receive'] for r in summarized_results['complete_bees']]
+        summarized_results['total_failed_requests_receive'] = sum(complete_results)
 
-    complete_results = [r['failed_requests_length'] for r in summarized_results['complete_bees']]
-    summarized_results['total_failed_requests_length'] = sum(complete_results)
+        complete_results = [r['failed_requests_length'] for r in summarized_results['complete_bees']]
+        summarized_results['total_failed_requests_length'] = sum(complete_results)
 
-    complete_results = [r['failed_requests_exceptions'] for r in summarized_results['complete_bees']]
-    summarized_results['total_failed_requests_exceptions'] = sum(complete_results)
+        complete_results = [r['failed_requests_exceptions'] for r in summarized_results['complete_bees']]
+        summarized_results['total_failed_requests_exceptions'] = sum(complete_results)
 
-    complete_results = [r['requests_per_second'] for r in summarized_results['complete_bees']]
-    summarized_results['mean_requests'] = sum(complete_results)
+        complete_results = [r['requests_per_second'] for r in summarized_results['complete_bees']]
+        summarized_results['mean_requests'] = sum(complete_results)
+
+    else:
+        summarized_results['total_failed_requests_connect'] = 0
+        summarized_results['total_failed_requests_receive'] = 0
+        summarized_results['total_failed_requests_length'] = 0
+        summarized_results['total_failed_requests_exceptions'] = 0
+        summarized_results['mean_requests'] = 0
 
     complete_results = [r['ms_per_request'] for r in summarized_results['complete_bees']]
     if summarized_results['num_complete_bees'] == 0:
@@ -518,8 +661,9 @@ def _print_results(summarized_results):
     if 'tpr_bounds' in summarized_results and summarized_results['tpr_bounds'] is not None:
         print '     Time per request:\t\t%f [ms] (lower bounds)' % summarized_results['tpr_bounds']
 
-    print '     50%% responses faster than:\t%f [ms]' % summarized_results['request_time_cdf'][49]
-    print '     90%% responses faster than:\t%f [ms]' % summarized_results['request_time_cdf'][89]
+    if len(summarized_results['request_time_cdf']) > 90:
+        print '     50%% responses faster than:\t%f [ms]' % summarized_results['request_time_cdf'][49]
+        print '     90%% responses faster than:\t%f [ms]' % summarized_results['request_time_cdf'][89]
 
     if 'performance_accepted' in summarized_results:
         print '     Performance check:\t\t%s' % summarized_results['performance_accepted']
@@ -604,6 +748,7 @@ def attack(url, n, c, **options):
             'headers': headers,
             'cookies': cookies,
             'post_file': options.get('post_file'),
+            'custom_attack': options.get('custom_attack'),
             'keep_alive': options.get('keep_alive'),
             'mime_type': options.get('mime_type', ''),
             'tpr': options.get('tpr'),
@@ -613,7 +758,11 @@ def attack(url, n, c, **options):
 
     print 'Stinging URL so it will be cached for the attack.'
 
+    if options.get('custom_attack', False):
+        # with custom attack url is just hostname - so add https://
+        url = "http://%s" % url
     request = urllib2.Request(url)
+
     # Need to revisit to support all http verbs.
     if post_file:
         try:
